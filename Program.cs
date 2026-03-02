@@ -1223,7 +1223,7 @@ app.MapGet("/", () => Results.Redirect("/index.html"));
 app.MapGet("/api/setups/save/test", (HttpContext ctx, AgentConfigService cfgSvc) =>
 {
     if (!TokenOk(ctx, cfgSvc)) return Results.Unauthorized();
-    return Results.Ok(new { ok = true });
+    return Results.Ok(new { success = true });
 });
 
 // ── POST /api/setups/save ─────────────────────────────────────────────────────
@@ -1237,20 +1237,20 @@ app.MapPost("/api/setups/save", async (
     if (!TokenOk(ctx, cfgSvc)) return Results.Unauthorized();
 
     if (string.IsNullOrWhiteSpace(req.Car) || string.IsNullOrWhiteSpace(req.Track))
-        return Results.NotFound(new { ok = false, error = "car/track not found" });
+        return Results.NotFound(new { success = false, error = "car/track not found" });
     if (string.IsNullOrWhiteSpace(req.Content))
-        return Results.BadRequest(new { ok = false, error = "content is required" });
+        return Results.BadRequest(new { success = false, error = "content is required" });
     if (string.IsNullOrWhiteSpace(req.FileName))
-        return Results.BadRequest(new { ok = false, error = "fileName is required" });
+        return Results.BadRequest(new { success = false, error = "fileName is required" });
 
     var safeCar   = SanitiseSegment(req.Car);
     var safeTrack = SanitiseSegment(req.Track);
     if (safeCar is null || safeTrack is null)
-        return Results.BadRequest(new { ok = false, error = "Invalid car or track." });
+        return Results.BadRequest(new { success = false, error = "Invalid car or track." });
 
     var safeFileName = SanitiseSegment(req.FileName.Trim());
     if (safeFileName is null)
-        return Results.BadRequest(new { ok = false, error = "Invalid fileName." });
+        return Results.BadRequest(new { success = false, error = "Invalid fileName." });
     if (!safeFileName.EndsWith(".ini", StringComparison.OrdinalIgnoreCase))
         safeFileName += ".ini";
 
@@ -1263,7 +1263,7 @@ app.MapPost("/api/setups/save", async (
 
     var dir = Path.GetFullPath(Path.Combine(root, safeCar, safeTrack));
     if (!dir.StartsWith(Path.GetFullPath(root) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
-        return Results.BadRequest(new { ok = false, error = "Resolved path escapes setup root." });
+        return Results.BadRequest(new { success = false, error = "Resolved path escapes setup root." });
 
     var absPath = Path.Combine(dir, safeFileName);
     logger.LogInformation("SAVE REQ car={Car} track={Track} fileName={FileName} bytes={Bytes}",
@@ -1279,21 +1279,15 @@ app.MapPost("/api/setups/save", async (
     catch (Exception ex)
     {
         logger.LogError(ex, "SAVE ERR path={Path}", absPath);
-        return Results.Problem(
-            statusCode: 500,
-            title: ex.Message,
-            extensions: new Dictionary<string, object?> {
-                ["ok"]    = false,
-                ["error"] = ex.Message,
-                ["stack"] = ex.StackTrace,
-                ["path"]  = absPath,
-            });
+        return Results.Json(
+            new { success = false, error = ex.Message, stack = ex.StackTrace, path = absPath },
+            statusCode: 500);
     }
 
     logger.LogInformation("SAVE OK path={Path}", absPath);
     refSvc.Rescan();
     var bytes = new FileInfo(absPath).Length;
-    return Results.Ok(new { ok = true, fileNameFinal = safeFileName, path = absPath, bytes });
+    return Results.Ok(new { success = true, fileNameFinal = safeFileName, path = absPath, bytes });
 });
 
 // ── Startup banner ────────────────────────────────────────────────────────
