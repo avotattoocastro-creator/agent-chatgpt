@@ -328,18 +328,8 @@ app.MapPost("/api/setup/apply", async (
     }
 });
 
-// ── POST /api/setup/save ──────────────────────────────────────────────────────
-app.MapPost("/api/setup/save", async (
-    HttpContext ctx,
-    AgentConfigService cfgSvc,
-    ILogger<Program> logger,
-    [FromBody] SetupSaveRequest req) =>
-{
-    if (!TokenOk(ctx, cfgSvc)) return Results.Unauthorized();
-    return await ExecuteSetupSave(
-        cfgSvc, logger, req.CarId, req.TrackId, req.FileName, req.SetupText,
-        req.Overwrite, relPath: null, versioned: req.Versioned);
-});
+// ── POST /api/setup/save — delegates to shared handler (see /api/setups/save) ─
+app.MapPost("/api/setup/save", HandleSetupSave);
 
 // ══ Admin endpoints (all require localhost guard + token) ══════════════════
 
@@ -1226,31 +1216,31 @@ app.MapGet("/api/setups/save/test", (HttpContext ctx, AgentConfigService cfgSvc)
     return Results.Ok(new { success = true });
 });
 
-// ── POST /api/setups/save ─────────────────────────────────────────────────────
-app.MapPost("/api/setups/save", async (
+// ── POST /api/setups/save  +  /api/setup/save (alias) ────────────────────────
+async Task<IResult> HandleSetupSave(
     HttpContext ctx,
     AgentConfigService cfgSvc,
     SetupReferenceService refSvc,
     ILogger<Program> logger,
-    [FromBody] SetupVersionedSaveRequest req) =>
+    SetupVersionedSaveRequest req)
 {
     if (!TokenOk(ctx, cfgSvc)) return Results.Unauthorized();
 
     if (string.IsNullOrWhiteSpace(req.Car) || string.IsNullOrWhiteSpace(req.Track))
-        return Results.NotFound(new { success = false, error = "car/track not found" });
+        return Results.BadRequest(new { success = false, error = "car and track are required", details = "car or track field was empty" });
     if (string.IsNullOrWhiteSpace(req.Content))
-        return Results.BadRequest(new { success = false, error = "content is required" });
+        return Results.BadRequest(new { success = false, error = "content is required", details = "content field was empty" });
     if (string.IsNullOrWhiteSpace(req.FileName))
-        return Results.BadRequest(new { success = false, error = "fileName is required" });
+        return Results.BadRequest(new { success = false, error = "fileName is required", details = "fileName field was empty" });
 
     var safeCar   = SanitiseSegment(req.Car);
     var safeTrack = SanitiseSegment(req.Track);
     if (safeCar is null || safeTrack is null)
-        return Results.BadRequest(new { success = false, error = "Invalid car or track." });
+        return Results.BadRequest(new { success = false, error = "Invalid car or track.", details = "car or track contains invalid path characters" });
 
     var safeFileName = SanitiseSegment(req.FileName.Trim());
     if (safeFileName is null)
-        return Results.BadRequest(new { success = false, error = "Invalid fileName." });
+        return Results.BadRequest(new { success = false, error = "Invalid fileName.", details = "fileName contains invalid path characters" });
     if (!safeFileName.EndsWith(".ini", StringComparison.OrdinalIgnoreCase))
         safeFileName += ".ini";
 
@@ -1263,7 +1253,7 @@ app.MapPost("/api/setups/save", async (
 
     var dir = Path.GetFullPath(Path.Combine(root, safeCar, safeTrack));
     if (!dir.StartsWith(Path.GetFullPath(root) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
-        return Results.BadRequest(new { success = false, error = "Resolved path escapes setup root." });
+        return Results.BadRequest(new { success = false, error = "Resolved path escapes setup root.", details = "car or track resolves outside the configured setup root" });
 
     var absPath = Path.Combine(dir, safeFileName);
     logger.LogInformation("SAVE REQ car={Car} track={Track} fileName={FileName} bytes={Bytes}",
@@ -1278,17 +1268,21 @@ app.MapPost("/api/setups/save", async (
     }
     catch (Exception ex)
     {
-        logger.LogError(ex, "SAVE ERR path={Path}", absPath);
+        const int statusCode = 500;
+        logger.LogError(ex, "SAVE FAIL status={Status} error={Error} exception={Exception}",
+            statusCode, ex.Message, ex.GetType().Name);
         return Results.Json(
-            new { success = false, error = ex.Message, stack = ex.StackTrace, path = absPath },
-            statusCode: 500);
+            new { success = false, error = ex.Message, details = ex.StackTrace },
+            statusCode: statusCode);
     }
 
     logger.LogInformation("SAVE OK path={Path}", absPath);
     refSvc.Rescan();
     var bytes = new FileInfo(absPath).Length;
     return Results.Ok(new { success = true, fileNameFinal = safeFileName, path = absPath, bytes });
-});
+}
+
+app.MapPost("/api/setups/save", HandleSetupSave);
 
 // ── Startup banner ────────────────────────────────────────────────────────
 app.Lifetime.ApplicationStarted.Register(() =>
@@ -1587,87 +1581,6 @@ static Dictionary<string, Dictionary<string, string>> ParseIniSections(string te
         }
     }
     return result;
-}
-
-// ── Shared setup-save logic ───────────────────────────────────────────────────
-static async Task<IResult> ExecuteSetupSave(
-    AgentConfigService cfgSvc,
-    ILogger logger,
-    string? carId, string? trackId, string? fileName, string? setupText,
-    bool overwrite, string? relPath, bool versioned = false)
-{
-    if (string.IsNullOrWhiteSpace(carId)    ||
-        string.IsNullOrWhiteSpace(trackId)  ||
-        string.IsNullOrWhiteSpace(fileName) ||
-        string.IsNullOrWhiteSpace(setupText))
-        return Results.BadRequest(new { error = "carId, trackId, fileName and setupText are required." });
-
-    var safeFileName = SanitiseSegment(fileName);
-    if (safeFileName is null)
-        return Results.BadRequest(new { error = "Invalid fileName." });
-    if (!safeFileName.EndsWith(".ini", StringComparison.OrdinalIgnoreCase))
-        safeFileName += ".ini";
-
-    var root = cfgSvc.Current.Setup.DefaultRoot;
-    if (string.IsNullOrWhiteSpace(root))
-    {
-        var docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
-        root = Path.Combine(docs, "Assetto Corsa", "setups");
-    }
-
-    string savedPath;
-    if (!string.IsNullOrWhiteSpace(relPath))
-    {
-        var resolved = Path.GetFullPath(Path.Combine(root, relPath));
-        if (!resolved.StartsWith(Path.GetFullPath(root) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
-            return Results.BadRequest(new { error = "Invalid relative path." });
-        savedPath = resolved;
-    }
-    else
-    {
-        var safeCarId   = SanitiseSegment(carId);
-        var safeTrackId = SanitiseSegment(trackId);
-        if (safeCarId is null || safeTrackId is null)
-            return Results.BadRequest(new { error = "Invalid carId or trackId." });
-
-        // When versioned, generate an AI-stamped filename and never overwrite the original.
-        if (versioned)
-        {
-            var baseName  = Path.GetFileNameWithoutExtension(safeFileName);
-            var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-            safeFileName  = $"{baseName}__AI_{timestamp}.ini";
-            overwrite     = false;
-        }
-
-        var dir = Path.Combine(root, safeCarId, safeTrackId);
-        savedPath = Path.Combine(dir, safeFileName);
-        if (!Path.GetFullPath(savedPath).StartsWith(
-                Path.GetFullPath(root) + Path.DirectorySeparatorChar,
-                StringComparison.Ordinal))
-            return Results.BadRequest(new { error = "Resolved path escapes setup directory." });
-    }
-
-    logger.LogInformation(
-        "SAVE REQ car={Car} track={Track} file={File} versioned={Versioned} bytes={Bytes}",
-        carId, trackId, safeFileName, versioned, setupText.Length);
-
-    if (!overwrite && File.Exists(savedPath))
-        return Results.Conflict(new { error = "File already exists. Set overwrite=true to replace." });
-
-    try
-    {
-        Directory.CreateDirectory(Path.GetDirectoryName(savedPath)!);
-        var tmp = savedPath + ".tmp";
-        await File.WriteAllTextAsync(tmp, setupText);
-        File.Move(tmp, savedPath, overwrite: true);
-        logger.LogInformation("SAVE OK path={Path}", savedPath);
-        return Results.Ok(new { ok = true, savedFileName = safeFileName, fullPath = savedPath });
-    }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, "SAVE ERR");
-        return Results.Problem(ex.Message);
-    }
 }
 
 // ── Request models ────────────────────────────────────────────────────────────
