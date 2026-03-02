@@ -96,6 +96,9 @@ var app = builder.Build();
 }
 
 // ── Static files (wwwroot → dashboard) ───────────────────────────────────
+// UseDefaultFiles must precede UseStaticFiles so that GET / maps to index.html
+// before the request reaches any middleware (including the localhost guard).
+app.UseDefaultFiles();
 app.UseStaticFiles();
 
 // ── CORS ─────────────────────────────────────────────────────────────────
@@ -223,6 +226,37 @@ app.MapGet("/api/info", (WebSocketHub hub, AcSharedMemoryReader reader) =>
 app.MapGet("/api/public/auth-info", () =>
     Results.Ok(new { tokenRequired = true }));
 
+// ── GET /healthz ──────────────────────────────────────────────────────────
+// Unauthenticated. Reports whether the static UI assets are reachable.
+app.MapGet("/healthz", (IWebHostEnvironment env, AgentConfigService cfgSvc) =>
+{
+    var webRoot       = ResolveWebRoot(env);
+    var webRootExists = Directory.Exists(webRoot);
+    var indexExists   = File.Exists(Path.Combine(webRoot, "index.html"));
+    return Results.Ok(new
+    {
+        ok                = true,
+        port              = cfgSvc.Current.Port,
+        urls              = app.Urls,
+        webRootExists,
+        staticIndexExists = indexExists,
+    });
+});
+
+// ── GET /ui-info ──────────────────────────────────────────────────────────
+// Unauthenticated. Returns physical paths for UI diagnostics.
+app.MapGet("/ui-info", (IWebHostEnvironment env) =>
+{
+    var webRoot = ResolveWebRoot(env);
+    return Results.Ok(new
+    {
+        contentRootPath = env.ContentRootPath,
+        webRootPath     = env.WebRootPath,
+        webRootExists   = Directory.Exists(webRoot),
+        indexExists     = File.Exists(Path.Combine(webRoot, "index.html")),
+    });
+});
+
 // ── POST /api/setup/apply ─────────────────────────────────────────────────────
 app.MapPost("/api/setup/apply", async (
     HttpContext ctx,
@@ -294,18 +328,8 @@ app.MapPost("/api/setup/apply", async (
     }
 });
 
-// ── POST /api/setup/save ──────────────────────────────────────────────────────
-app.MapPost("/api/setup/save", async (
-    HttpContext ctx,
-    AgentConfigService cfgSvc,
-    ILogger<Program> logger,
-    [FromBody] SetupSaveRequest req) =>
-{
-    if (!TokenOk(ctx, cfgSvc)) return Results.Unauthorized();
-    return await ExecuteSetupSave(
-        cfgSvc, logger, req.CarId, req.TrackId, req.FileName, req.SetupText,
-        req.Overwrite, relPath: null, versioned: req.Versioned);
-});
+// ── POST /api/setup/save — delegates to shared handler (see /api/setups/save) ─
+app.MapPost("/api/setup/save", HandleSetupSave);
 
 // ══ Admin endpoints (all require localhost guard + token) ══════════════════
 
@@ -741,6 +765,80 @@ app.MapGet("/api/reference/setups", (
     return Results.Ok(fileNames);
 });
 
+// ── POST /api/reference/setups/save ──────────────────────────────────────────
+app.MapPost("/api/reference/setups/save", async (
+    HttpContext ctx,
+    AgentConfigService cfgSvc,
+    LogBuffer logBuf,
+    [FromBody] ReferenceSetupsSaveRequest req) =>
+{
+    if (!TokenOk(ctx, cfgSvc)) return Results.Unauthorized();
+
+    if (string.IsNullOrWhiteSpace(req.Car) || !IsValidRefSegment(req.Car))
+        return Results.BadRequest(new { error = "Valid car is required." });
+    if (string.IsNullOrWhiteSpace(req.Track) || !IsValidRefSegment(req.Track))
+        return Results.BadRequest(new { error = "Valid track is required." });
+    if (string.IsNullOrWhiteSpace(req.FileName))
+        return Results.BadRequest(new { error = "fileName is required." });
+    if (string.IsNullOrWhiteSpace(req.SetupText))
+        return Results.BadRequest(new { error = "setupText is required." });
+
+    var safeCar   = SanitiseSegment(req.Car);
+    var safeTrack = SanitiseSegment(req.Track);
+    var safeFile  = SanitiseSegment(req.FileName);
+    if (safeCar is null || safeTrack is null || safeFile is null)
+        return Results.BadRequest(new { error = "Invalid car, track, or fileName." });
+
+    if (!safeFile.EndsWith(".ini", StringComparison.OrdinalIgnoreCase))
+        safeFile += ".ini";
+
+    var root = cfgSvc.Current.Setup.DefaultRoot;
+    if (string.IsNullOrWhiteSpace(root))
+    {
+        var docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+        root = Path.Combine(docs, "Assetto Corsa", "setups");
+    }
+
+    var dir     = Path.Combine(root, safeCar, safeTrack);
+    var absPath = Path.GetFullPath(Path.Combine(dir, safeFile));
+    if (!absPath.StartsWith(Path.GetFullPath(root) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+        return Results.BadRequest(new { error = "Resolved path escapes setup directory." });
+
+    logBuf.Add(LogLevel.Information, "SetupSave",
+        $"SAVE REQUEST car={req.Car} track={req.Track} fileName={safeFile} overwrite={req.Overwrite} bytes={req.SetupText.Length}");
+
+    if (!req.Overwrite && File.Exists(absPath))
+        return Results.Conflict(new { error = "File already exists. Set overwrite=true to replace." });
+
+    try
+    {
+        Directory.CreateDirectory(dir);
+        var tmp = absPath + ".tmp";
+        try
+        {
+            await File.WriteAllTextAsync(tmp, req.SetupText);
+            File.Move(tmp, absPath, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) try { File.Delete(tmp); } catch { /* best effort */ }
+        }
+        logBuf.Add(LogLevel.Information, "SetupSave",
+            $"SAVE OK savedFile={safeFile} path={absPath}");
+        return Results.Ok(new { ok = true, path = absPath, savedFile = safeFile });
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        logBuf.Add(LogLevel.Error, "SetupSave", $"SAVE ERR UnauthorizedAccess: {ex.Message}");
+        return Results.Json(new { error = $"Access denied: {ex.Message}" }, statusCode: StatusCodes.Status403Forbidden);
+    }
+    catch (Exception ex)
+    {
+        logBuf.Add(LogLevel.Error, "SetupSave", $"SAVE ERR {ex.GetType().Name}: {ex.Message}");
+        return Results.Problem(ex.Message);
+    }
+});
+
 // ── GET /api/reference/setup/read?car=...&track=...&file=... ─────────────────
 app.MapGet("/api/reference/setup/read", async (
     HttpContext ctx,
@@ -1111,62 +1209,101 @@ app.MapGet("/api/setups/reference/tree", (
 
 app.MapGet("/", () => Results.Redirect("/index.html"));
 
-// ── POST /api/setups/save ─────────────────────────────────────────────────────
-app.MapPost("/api/setups/save", async (
+// ── GET /api/setups/save/test ─────────────────────────────────────────────────
+app.MapGet("/api/setups/save/test", (HttpContext ctx, AgentConfigService cfgSvc) =>
+{
+    if (!TokenOk(ctx, cfgSvc)) return Results.Unauthorized();
+    return Results.Ok(new { success = true });
+});
+
+// ── POST /api/setups/save  +  /api/setup/save (alias) ────────────────────────
+async Task<IResult> HandleSetupSave(
     HttpContext ctx,
     AgentConfigService cfgSvc,
     SetupReferenceService refSvc,
-    [FromBody] SetupVersionedSaveRequest req) =>
+    ILogger<Program> logger,
+    SetupVersionedSaveRequest req)
 {
     if (!TokenOk(ctx, cfgSvc)) return Results.Unauthorized();
-    if (string.IsNullOrWhiteSpace(req.Car)   || !IsValidRefSegment(req.Car))
-        return Results.BadRequest(new { error = "Valid car is required." });
-    if (string.IsNullOrWhiteSpace(req.Track) || !IsValidRefSegment(req.Track))
-        return Results.BadRequest(new { error = "Valid track is required." });
+
+    if (string.IsNullOrWhiteSpace(req.Car) || string.IsNullOrWhiteSpace(req.Track))
+        return Results.BadRequest(new { success = false, error = "car and track are required", details = "car or track field was empty" });
     if (string.IsNullOrWhiteSpace(req.Content))
-        return Results.BadRequest(new { error = "content is required." });
-
-    var root = cfgSvc.Current.Setup.ReferenceRoot;
-    if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
-        return Results.BadRequest(new { error = "ReferenceRoot is not configured." });
-
-    var baseName = string.IsNullOrWhiteSpace(req.BaseFileName) ? "iter" : req.BaseFileName.Trim();
-    if (!IsValidRefSegment(baseName))
-        return Results.BadRequest(new { error = "Invalid baseFileName." });
+        return Results.BadRequest(new { success = false, error = "content is required", details = "content field was empty" });
+    if (string.IsNullOrWhiteSpace(req.FileName))
+        return Results.BadRequest(new { success = false, error = "fileName is required", details = "fileName field was empty" });
 
     var safeCar   = SanitiseSegment(req.Car);
     var safeTrack = SanitiseSegment(req.Track);
     if (safeCar is null || safeTrack is null)
-        return Results.BadRequest(new { error = "Invalid car or track." });
+        return Results.BadRequest(new { success = false, error = "Invalid car or track.", details = "car or track contains invalid path characters" });
+
+    var safeFileName = SanitiseSegment(req.FileName.Trim());
+    if (safeFileName is null)
+        return Results.BadRequest(new { success = false, error = "Invalid fileName.", details = "fileName contains invalid path characters" });
+    if (!safeFileName.EndsWith(".ini", StringComparison.OrdinalIgnoreCase))
+        safeFileName += ".ini";
+
+    var root = cfgSvc.Current.Setup.DefaultRoot;
+    if (string.IsNullOrWhiteSpace(root))
+    {
+        var docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+        root = Path.Combine(docs, "Assetto Corsa", "setups");
+    }
 
     var dir = Path.GetFullPath(Path.Combine(root, safeCar, safeTrack));
     if (!dir.StartsWith(Path.GetFullPath(root) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
-        return Results.BadRequest(new { error = "Resolved path escapes reference root." });
+        return Results.BadRequest(new { success = false, error = "Resolved path escapes setup root.", details = "car or track resolves outside the configured setup root" });
 
-    Directory.CreateDirectory(dir);
-    var fileName = NextVersionedFileName(dir, baseName);
-    var absPath  = Path.Combine(dir, fileName);
+    var absPath = Path.Combine(dir, safeFileName);
+    logger.LogInformation("SAVE REQ car={Car} track={Track} fileName={FileName} bytes={Bytes}",
+        req.Car, req.Track, safeFileName, req.Content.Length);
 
     try
     {
+        Directory.CreateDirectory(dir);
         var tmp = absPath + ".tmp";
         await File.WriteAllTextAsync(tmp, req.Content);
-        File.Move(tmp, absPath, overwrite: false);
+        File.Move(tmp, absPath, overwrite: true);
     }
-    catch (IOException)
+    catch (Exception ex)
     {
-        return Results.Conflict(new { error = "File already exists (concurrent write). Please retry." });
+        const int statusCode = 500;
+        logger.LogError(ex, "SAVE FAIL status={Status} error={Error} exception={Exception}",
+            statusCode, ex.Message, ex.GetType().Name);
+        return Results.Json(
+            new { success = false, error = ex.Message, details = ex.StackTrace },
+            statusCode: statusCode);
     }
 
+    logger.LogInformation("SAVE OK path={Path}", absPath);
     refSvc.Rescan();
-    return Results.Ok(new { ok = true, fileName });
-});
+    var bytes = new FileInfo(absPath).Length;
+    return Results.Ok(new { success = true, fileNameFinal = safeFileName, path = absPath, bytes });
+}
+
+app.MapPost("/api/setups/save", HandleSetupSave);
 
 // ── Startup banner ────────────────────────────────────────────────────────
 app.Lifetime.ApplicationStarted.Register(() =>
 {
-    var cfg = app.Services.GetRequiredService<AgentConfigService>().Current;
+    var cfg     = app.Services.GetRequiredService<AgentConfigService>().Current;
+    var env     = app.Services.GetRequiredService<IWebHostEnvironment>();
+    var webRoot = ResolveWebRoot(env);
+    var wwwOk   = Directory.Exists(webRoot) && File.Exists(Path.Combine(webRoot, "index.html"));
+
+    if (wwwOk)
+        app.Logger.LogInformation("Serving UI from: {WebRoot} (exists=true)", webRoot);
+    else
+        app.Logger.LogError(
+            "Dashboard UI NOT FOUND at {WebRoot}. " +
+            "Ensure wwwroot/index.html is present in the output directory. " +
+            "Run `dotnet publish` and check the publish output.",
+            webRoot);
+
+    app.Logger.LogInformation("Listening on: http://0.0.0.0:{Port}", cfg.Port);
     app.Logger.LogInformation("Agent started on port {Port}", cfg.Port);
+
     Console.ForegroundColor = ConsoleColor.Cyan;
     Console.WriteLine();
     Console.WriteLine("╔══════════════════════════════════════╗");
@@ -1178,16 +1315,25 @@ app.Lifetime.ApplicationStarted.Register(() =>
     Console.WriteLine($"  WebSocket  : ws://localhost:{cfg.Port}/ws?token=***");
     Console.WriteLine($"  Log Stream : ws://localhost:{cfg.Port}/ws/logs?token=***");
     Console.WriteLine($"  Ping       : http://localhost:{cfg.Port}/api/ping");
+    Console.WriteLine($"  Health     : http://localhost:{cfg.Port}/healthz");
+    Console.WriteLine($"  UI Info    : http://localhost:{cfg.Port}/ui-info");
     Console.WriteLine($"  Info       : http://localhost:{cfg.Port}/api/info");
     Console.WriteLine($"  Setup      : POST http://localhost:{cfg.Port}/api/setup/apply");
     Console.WriteLine($"  Setup Save : POST http://localhost:{cfg.Port}/api/setup/save");
     Console.WriteLine($"  Setup SaveV: POST http://localhost:{cfg.Port}/api/setups/save");
+    Console.WriteLine($"  Ref Setup  : POST http://localhost:{cfg.Port}/api/reference/setups/save");
     Console.WriteLine($"  Ref Root   : GET  http://localhost:{cfg.Port}/api/reference/root");
     Console.WriteLine($"  Ref Cars   : GET  http://localhost:{cfg.Port}/api/reference/cars");
     Console.WriteLine($"  Ref Tree   : GET  http://localhost:{cfg.Port}/api/setups/reference/tree");
     Console.WriteLine($"  Admin      : http://localhost:{cfg.Port}/api/admin/state");
     Console.WriteLine($"  Metrics    : http://localhost:{cfg.Port}/api/admin/metrics");
     Console.WriteLine($"  Logs       : http://localhost:{cfg.Port}/api/admin/logs");
+    if (!wwwOk)
+    {
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine($"  [ERROR] Dashboard UI missing at: {webRoot}");
+        Console.ResetColor();
+    }
     Console.WriteLine();
     Console.ForegroundColor = ConsoleColor.DarkGray;
     Console.WriteLine("  Keyboard shortcuts (dashboard): S=start/stop  D=diagnostics  L=logs");
@@ -1249,6 +1395,14 @@ static string? SanitiseSegment(string? segment)
     if (segment is "." or "..") return null;
     return segment;
 }
+
+/// <summary>
+/// Returns the physical wwwroot path from the environment, falling back to
+/// "wwwroot" beside the executing assembly when <see cref="IWebHostEnvironment.WebRootPath"/>
+/// is null (e.g. when running directly from source without a publish step).
+/// </summary>
+static string ResolveWebRoot(IWebHostEnvironment env)
+    => env.WebRootPath ?? Path.Combine(AppContext.BaseDirectory, "wwwroot");
 
 static bool IsDirectoryWritable(string dir)
 {
@@ -1313,23 +1467,6 @@ static bool IsRefRootConfigured(AgentConfigService cfgSvc)
 {
     var r = cfgSvc.Current.Setup.ReferenceRoot;
     return !string.IsNullOrWhiteSpace(r) && Directory.Exists(r);
-}
-
-/// <summary>
-/// Returns a filename for <paramref name="baseName"/> that does not yet
-/// exist in <paramref name="dir"/>. Tries base.ini first, then
-/// base_v2.ini, base_v3.ini … up to 9999.
-/// </summary>
-static string NextVersionedFileName(string dir, string baseName)
-{
-    var candidate = baseName + ".ini";
-    if (!File.Exists(Path.Combine(dir, candidate))) return candidate;
-    for (int v = 2; v <= 9999; v++)
-    {
-        candidate = $"{baseName}_v{v}.ini";
-        if (!File.Exists(Path.Combine(dir, candidate))) return candidate;
-    }
-    return $"{baseName}_{DateTimeOffset.UtcNow:yyyyMMddHHmmssfff}.ini";
 }
 
 /// <summary>
@@ -1446,87 +1583,6 @@ static Dictionary<string, Dictionary<string, string>> ParseIniSections(string te
     return result;
 }
 
-// ── Shared setup-save logic ───────────────────────────────────────────────────
-static async Task<IResult> ExecuteSetupSave(
-    AgentConfigService cfgSvc,
-    ILogger logger,
-    string? carId, string? trackId, string? fileName, string? setupText,
-    bool overwrite, string? relPath, bool versioned = false)
-{
-    if (string.IsNullOrWhiteSpace(carId)    ||
-        string.IsNullOrWhiteSpace(trackId)  ||
-        string.IsNullOrWhiteSpace(fileName) ||
-        string.IsNullOrWhiteSpace(setupText))
-        return Results.BadRequest(new { error = "carId, trackId, fileName and setupText are required." });
-
-    var safeFileName = SanitiseSegment(fileName);
-    if (safeFileName is null)
-        return Results.BadRequest(new { error = "Invalid fileName." });
-    if (!safeFileName.EndsWith(".ini", StringComparison.OrdinalIgnoreCase))
-        safeFileName += ".ini";
-
-    var root = cfgSvc.Current.Setup.DefaultRoot;
-    if (string.IsNullOrWhiteSpace(root))
-    {
-        var docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
-        root = Path.Combine(docs, "Assetto Corsa", "setups");
-    }
-
-    string savedPath;
-    if (!string.IsNullOrWhiteSpace(relPath))
-    {
-        var resolved = Path.GetFullPath(Path.Combine(root, relPath));
-        if (!resolved.StartsWith(Path.GetFullPath(root) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
-            return Results.BadRequest(new { error = "Invalid relative path." });
-        savedPath = resolved;
-    }
-    else
-    {
-        var safeCarId   = SanitiseSegment(carId);
-        var safeTrackId = SanitiseSegment(trackId);
-        if (safeCarId is null || safeTrackId is null)
-            return Results.BadRequest(new { error = "Invalid carId or trackId." });
-
-        // When versioned, generate an AI-stamped filename and never overwrite the original.
-        if (versioned)
-        {
-            var baseName  = Path.GetFileNameWithoutExtension(safeFileName);
-            var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-            safeFileName  = $"{baseName}__AI_{timestamp}.ini";
-            overwrite     = false;
-        }
-
-        var dir = Path.Combine(root, safeCarId, safeTrackId);
-        savedPath = Path.Combine(dir, safeFileName);
-        if (!Path.GetFullPath(savedPath).StartsWith(
-                Path.GetFullPath(root) + Path.DirectorySeparatorChar,
-                StringComparison.Ordinal))
-            return Results.BadRequest(new { error = "Resolved path escapes setup directory." });
-    }
-
-    logger.LogInformation(
-        "SAVE REQ car={Car} track={Track} file={File} versioned={Versioned} bytes={Bytes}",
-        carId, trackId, safeFileName, versioned, setupText.Length);
-
-    if (!overwrite && File.Exists(savedPath))
-        return Results.Conflict(new { error = "File already exists. Set overwrite=true to replace." });
-
-    try
-    {
-        Directory.CreateDirectory(Path.GetDirectoryName(savedPath)!);
-        var tmp = savedPath + ".tmp";
-        await File.WriteAllTextAsync(tmp, setupText);
-        File.Move(tmp, savedPath, overwrite: true);
-        logger.LogInformation("SAVE OK path={Path}", savedPath);
-        return Results.Ok(new { ok = true, savedFileName = safeFileName, fullPath = savedPath });
-    }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, "SAVE ERR");
-        return Results.Problem(ex.Message);
-    }
-}
-
 // ── Request models ────────────────────────────────────────────────────────────
 record ApplySetupChangeDto(string Section, string Key, string Value);
 
@@ -1571,8 +1627,15 @@ record ReferenceRootSetRequest(string? Path);
 record SetupVersionedSaveRequest(
     string? Car,
     string? Track,
-    string? BaseFileName,
+    string? FileName,
     string? Content);
+
+record ReferenceSetupsSaveRequest(
+    string? Car,
+    string? Track,
+    string? FileName,
+    string? SetupText,
+    bool    Overwrite = false);
 
 /// <summary>
 /// Caches the machine's own unicast IP addresses, refreshed every 30 seconds.
