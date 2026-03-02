@@ -1219,58 +1219,81 @@ app.MapGet("/api/setups/reference/tree", (
 
 app.MapGet("/", () => Results.Redirect("/index.html"));
 
+// ── GET /api/setups/save/test ─────────────────────────────────────────────────
+app.MapGet("/api/setups/save/test", (HttpContext ctx, AgentConfigService cfgSvc) =>
+{
+    if (!TokenOk(ctx, cfgSvc)) return Results.Unauthorized();
+    return Results.Ok(new { ok = true });
+});
+
 // ── POST /api/setups/save ─────────────────────────────────────────────────────
 app.MapPost("/api/setups/save", async (
     HttpContext ctx,
     AgentConfigService cfgSvc,
     SetupReferenceService refSvc,
+    ILogger<Program> logger,
     [FromBody] SetupVersionedSaveRequest req) =>
 {
     if (!TokenOk(ctx, cfgSvc)) return Results.Unauthorized();
-    if (string.IsNullOrWhiteSpace(req.CarId)   || !IsValidRefSegment(req.CarId))
-        return Results.BadRequest(new { error = "Valid carId is required." });
-    if (string.IsNullOrWhiteSpace(req.TrackId) || !IsValidRefSegment(req.TrackId))
-        return Results.BadRequest(new { error = "Valid trackId is required." });
-    if (string.IsNullOrWhiteSpace(req.FileName))
-        return Results.BadRequest(new { error = "fileName is required." });
-    if (string.IsNullOrWhiteSpace(req.Content))
-        return Results.BadRequest(new { error = "content is required." });
 
-    var root = cfgSvc.Current.Setup.ReferenceRoot;
-    if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
-        return Results.BadRequest(new { error = "ReferenceRoot is not configured." });
+    if (string.IsNullOrWhiteSpace(req.Car) || string.IsNullOrWhiteSpace(req.Track))
+        return Results.NotFound(new { ok = false, error = "car/track not found" });
+    if (string.IsNullOrWhiteSpace(req.Content))
+        return Results.BadRequest(new { ok = false, error = "content is required" });
+    if (string.IsNullOrWhiteSpace(req.FileName))
+        return Results.BadRequest(new { ok = false, error = "fileName is required" });
+
+    var safeCar   = SanitiseSegment(req.Car);
+    var safeTrack = SanitiseSegment(req.Track);
+    if (safeCar is null || safeTrack is null)
+        return Results.BadRequest(new { ok = false, error = "Invalid car or track." });
 
     var safeFileName = SanitiseSegment(req.FileName.Trim());
     if (safeFileName is null)
-        return Results.BadRequest(new { error = "Invalid fileName." });
+        return Results.BadRequest(new { ok = false, error = "Invalid fileName." });
     if (!safeFileName.EndsWith(".ini", StringComparison.OrdinalIgnoreCase))
         safeFileName += ".ini";
 
-    var safeCar   = SanitiseSegment(req.CarId);
-    var safeTrack = SanitiseSegment(req.TrackId);
-    if (safeCar is null || safeTrack is null)
-        return Results.BadRequest(new { error = "Invalid carId or trackId." });
+    var root = cfgSvc.Current.Setup.DefaultRoot;
+    if (string.IsNullOrWhiteSpace(root))
+    {
+        var docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+        root = Path.Combine(docs, "Assetto Corsa", "setups");
+    }
 
     var dir = Path.GetFullPath(Path.Combine(root, safeCar, safeTrack));
     if (!dir.StartsWith(Path.GetFullPath(root) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
-        return Results.BadRequest(new { error = "Resolved path escapes reference root." });
+        return Results.BadRequest(new { ok = false, error = "Resolved path escapes setup root." });
 
-    Directory.CreateDirectory(dir);
     var absPath = Path.Combine(dir, safeFileName);
+    logger.LogInformation("SAVE REQ car={Car} track={Track} fileName={FileName} bytes={Bytes}",
+        req.Car, req.Track, safeFileName, req.Content.Length);
 
     try
     {
+        Directory.CreateDirectory(dir);
         var tmp = absPath + ".tmp";
         await File.WriteAllTextAsync(tmp, req.Content);
         File.Move(tmp, absPath, overwrite: true);
     }
-    catch (IOException)
+    catch (Exception ex)
     {
-        return Results.Conflict(new { error = "Failed to write file. Please check permissions and disk space." });
+        logger.LogError(ex, "SAVE ERR path={Path}", absPath);
+        return Results.Problem(
+            statusCode: 500,
+            title: ex.Message,
+            extensions: new Dictionary<string, object?> {
+                ["ok"]    = false,
+                ["error"] = ex.Message,
+                ["stack"] = ex.StackTrace,
+                ["path"]  = absPath,
+            });
     }
 
+    logger.LogInformation("SAVE OK path={Path}", absPath);
     refSvc.Rescan();
-    return Results.Ok(new { ok = true, fileName = safeFileName, savedPath = absPath });
+    var bytes = new FileInfo(absPath).Length;
+    return Results.Ok(new { ok = true, fileNameFinal = safeFileName, path = absPath, bytes });
 });
 
 // ── Startup banner ────────────────────────────────────────────────────────
@@ -1695,8 +1718,8 @@ record SetupSaveRequest(
 record ReferenceRootSetRequest(string? Path);
 
 record SetupVersionedSaveRequest(
-    string? CarId,
-    string? TrackId,
+    string? Car,
+    string? Track,
     string? FileName,
     string? Content);
 
