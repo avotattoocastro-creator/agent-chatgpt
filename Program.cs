@@ -96,6 +96,9 @@ var app = builder.Build();
 }
 
 // ── Static files (wwwroot → dashboard) ───────────────────────────────────
+// UseDefaultFiles must precede UseStaticFiles so that GET / maps to index.html
+// before the request reaches any middleware (including the localhost guard).
+app.UseDefaultFiles();
 app.UseStaticFiles();
 
 // ── CORS ─────────────────────────────────────────────────────────────────
@@ -222,6 +225,37 @@ app.MapGet("/api/info", (WebSocketHub hub, AcSharedMemoryReader reader) =>
 // ── GET /api/public/auth-info ─────────────────────────────────────────────
 app.MapGet("/api/public/auth-info", () =>
     Results.Ok(new { tokenRequired = true }));
+
+// ── GET /healthz ──────────────────────────────────────────────────────────
+// Unauthenticated. Reports whether the static UI assets are reachable.
+app.MapGet("/healthz", (IWebHostEnvironment env, AgentConfigService cfgSvc) =>
+{
+    var webRoot       = ResolveWebRoot(env);
+    var webRootExists = Directory.Exists(webRoot);
+    var indexExists   = File.Exists(Path.Combine(webRoot, "index.html"));
+    return Results.Ok(new
+    {
+        ok                = true,
+        port              = cfgSvc.Current.Port,
+        urls              = app.Urls,
+        webRootExists,
+        staticIndexExists = indexExists,
+    });
+});
+
+// ── GET /ui-info ──────────────────────────────────────────────────────────
+// Unauthenticated. Returns physical paths for UI diagnostics.
+app.MapGet("/ui-info", (IWebHostEnvironment env) =>
+{
+    var webRoot = ResolveWebRoot(env);
+    return Results.Ok(new
+    {
+        contentRootPath = env.ContentRootPath,
+        webRootPath     = env.WebRootPath,
+        webRootExists   = Directory.Exists(webRoot),
+        indexExists     = File.Exists(Path.Combine(webRoot, "index.html")),
+    });
+});
 
 // ── POST /api/setup/apply ─────────────────────────────────────────────────────
 app.MapPost("/api/setup/apply", async (
@@ -1239,8 +1273,23 @@ app.MapPost("/api/setups/save", async (
 // ── Startup banner ────────────────────────────────────────────────────────
 app.Lifetime.ApplicationStarted.Register(() =>
 {
-    var cfg = app.Services.GetRequiredService<AgentConfigService>().Current;
+    var cfg     = app.Services.GetRequiredService<AgentConfigService>().Current;
+    var env     = app.Services.GetRequiredService<IWebHostEnvironment>();
+    var webRoot = ResolveWebRoot(env);
+    var wwwOk   = Directory.Exists(webRoot) && File.Exists(Path.Combine(webRoot, "index.html"));
+
+    if (wwwOk)
+        app.Logger.LogInformation("Serving UI from: {WebRoot} (exists=true)", webRoot);
+    else
+        app.Logger.LogError(
+            "Dashboard UI NOT FOUND at {WebRoot}. " +
+            "Ensure wwwroot/index.html is present in the output directory. " +
+            "Run `dotnet publish` and check the publish output.",
+            webRoot);
+
+    app.Logger.LogInformation("Listening on: http://0.0.0.0:{Port}", cfg.Port);
     app.Logger.LogInformation("Agent started on port {Port}", cfg.Port);
+
     Console.ForegroundColor = ConsoleColor.Cyan;
     Console.WriteLine();
     Console.WriteLine("╔══════════════════════════════════════╗");
@@ -1252,6 +1301,8 @@ app.Lifetime.ApplicationStarted.Register(() =>
     Console.WriteLine($"  WebSocket  : ws://localhost:{cfg.Port}/ws?token=***");
     Console.WriteLine($"  Log Stream : ws://localhost:{cfg.Port}/ws/logs?token=***");
     Console.WriteLine($"  Ping       : http://localhost:{cfg.Port}/api/ping");
+    Console.WriteLine($"  Health     : http://localhost:{cfg.Port}/healthz");
+    Console.WriteLine($"  UI Info    : http://localhost:{cfg.Port}/ui-info");
     Console.WriteLine($"  Info       : http://localhost:{cfg.Port}/api/info");
     Console.WriteLine($"  Setup      : POST http://localhost:{cfg.Port}/api/setup/apply");
     Console.WriteLine($"  Setup Save : POST http://localhost:{cfg.Port}/api/setup/save");
@@ -1263,6 +1314,12 @@ app.Lifetime.ApplicationStarted.Register(() =>
     Console.WriteLine($"  Admin      : http://localhost:{cfg.Port}/api/admin/state");
     Console.WriteLine($"  Metrics    : http://localhost:{cfg.Port}/api/admin/metrics");
     Console.WriteLine($"  Logs       : http://localhost:{cfg.Port}/api/admin/logs");
+    if (!wwwOk)
+    {
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine($"  [ERROR] Dashboard UI missing at: {webRoot}");
+        Console.ResetColor();
+    }
     Console.WriteLine();
     Console.ForegroundColor = ConsoleColor.DarkGray;
     Console.WriteLine("  Keyboard shortcuts (dashboard): S=start/stop  D=diagnostics  L=logs");
@@ -1324,6 +1381,14 @@ static string? SanitiseSegment(string? segment)
     if (segment is "." or "..") return null;
     return segment;
 }
+
+/// <summary>
+/// Returns the physical wwwroot path from the environment, falling back to
+/// "wwwroot" beside the executing assembly when <see cref="IWebHostEnvironment.WebRootPath"/>
+/// is null (e.g. when running directly from source without a publish step).
+/// </summary>
+static string ResolveWebRoot(IWebHostEnvironment env)
+    => env.WebRootPath ?? Path.Combine(AppContext.BaseDirectory, "wwwroot");
 
 static bool IsDirectoryWritable(string dir)
 {
