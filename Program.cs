@@ -741,6 +741,80 @@ app.MapGet("/api/reference/setups", (
     return Results.Ok(fileNames);
 });
 
+// ── POST /api/reference/setups/save ──────────────────────────────────────────
+app.MapPost("/api/reference/setups/save", async (
+    HttpContext ctx,
+    AgentConfigService cfgSvc,
+    LogBuffer logBuf,
+    [FromBody] ReferenceSetupsSaveRequest req) =>
+{
+    if (!TokenOk(ctx, cfgSvc)) return Results.Unauthorized();
+
+    if (string.IsNullOrWhiteSpace(req.Car) || !IsValidRefSegment(req.Car))
+        return Results.BadRequest(new { error = "Valid car is required." });
+    if (string.IsNullOrWhiteSpace(req.Track) || !IsValidRefSegment(req.Track))
+        return Results.BadRequest(new { error = "Valid track is required." });
+    if (string.IsNullOrWhiteSpace(req.FileName))
+        return Results.BadRequest(new { error = "fileName is required." });
+    if (string.IsNullOrWhiteSpace(req.SetupText))
+        return Results.BadRequest(new { error = "setupText is required." });
+
+    var safeCar   = SanitiseSegment(req.Car);
+    var safeTrack = SanitiseSegment(req.Track);
+    var safeFile  = SanitiseSegment(req.FileName);
+    if (safeCar is null || safeTrack is null || safeFile is null)
+        return Results.BadRequest(new { error = "Invalid car, track, or fileName." });
+
+    if (!safeFile.EndsWith(".ini", StringComparison.OrdinalIgnoreCase))
+        safeFile += ".ini";
+
+    var root = cfgSvc.Current.Setup.DefaultRoot;
+    if (string.IsNullOrWhiteSpace(root))
+    {
+        var docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+        root = Path.Combine(docs, "Assetto Corsa", "setups");
+    }
+
+    var dir     = Path.Combine(root, safeCar, safeTrack);
+    var absPath = Path.GetFullPath(Path.Combine(dir, safeFile));
+    if (!absPath.StartsWith(Path.GetFullPath(root) + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+        return Results.BadRequest(new { error = "Resolved path escapes setup directory." });
+
+    logBuf.Add(LogLevel.Information, "SetupSave",
+        $"SAVE REQUEST car={req.Car} track={req.Track} fileName={safeFile} overwrite={req.Overwrite} bytes={req.SetupText.Length}");
+
+    if (!req.Overwrite && File.Exists(absPath))
+        return Results.Conflict(new { error = "File already exists. Set overwrite=true to replace." });
+
+    try
+    {
+        Directory.CreateDirectory(dir);
+        var tmp = absPath + ".tmp";
+        try
+        {
+            await File.WriteAllTextAsync(tmp, req.SetupText);
+            File.Move(tmp, absPath, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) try { File.Delete(tmp); } catch { /* best effort */ }
+        }
+        logBuf.Add(LogLevel.Information, "SetupSave",
+            $"SAVE OK savedFile={safeFile} path={absPath}");
+        return Results.Ok(new { ok = true, path = absPath, savedFile = safeFile });
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        logBuf.Add(LogLevel.Error, "SetupSave", $"SAVE ERR UnauthorizedAccess: {ex.Message}");
+        return Results.Json(new { error = $"Access denied: {ex.Message}" }, statusCode: StatusCodes.Status403Forbidden);
+    }
+    catch (Exception ex)
+    {
+        logBuf.Add(LogLevel.Error, "SetupSave", $"SAVE ERR {ex.GetType().Name}: {ex.Message}");
+        return Results.Problem(ex.Message);
+    }
+});
+
 // ── GET /api/reference/setup/read?car=...&track=...&file=... ─────────────────
 app.MapGet("/api/reference/setup/read", async (
     HttpContext ctx,
@@ -1182,6 +1256,7 @@ app.Lifetime.ApplicationStarted.Register(() =>
     Console.WriteLine($"  Setup      : POST http://localhost:{cfg.Port}/api/setup/apply");
     Console.WriteLine($"  Setup Save : POST http://localhost:{cfg.Port}/api/setup/save");
     Console.WriteLine($"  Setup SaveV: POST http://localhost:{cfg.Port}/api/setups/save");
+    Console.WriteLine($"  Ref Setup  : POST http://localhost:{cfg.Port}/api/reference/setups/save");
     Console.WriteLine($"  Ref Root   : GET  http://localhost:{cfg.Port}/api/reference/root");
     Console.WriteLine($"  Ref Cars   : GET  http://localhost:{cfg.Port}/api/reference/cars");
     Console.WriteLine($"  Ref Tree   : GET  http://localhost:{cfg.Port}/api/setups/reference/tree");
@@ -1573,6 +1648,13 @@ record SetupVersionedSaveRequest(
     string? Track,
     string? BaseFileName,
     string? Content);
+
+record ReferenceSetupsSaveRequest(
+    string? Car,
+    string? Track,
+    string? FileName,
+    string? SetupText,
+    bool    Overwrite = false);
 
 /// <summary>
 /// Caches the machine's own unicast IP addresses, refreshed every 30 seconds.
